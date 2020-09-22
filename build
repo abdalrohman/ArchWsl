@@ -1,0 +1,315 @@
+#!/usr/bin/env bash
+
+# shellcheck disable=SC2128
+# shellcheck disable=SC1090
+# shellcheck disable=SC2207
+# shellcheck disable=SC2059
+
+PATH_DIR=$(dirname "${BASH_SOURCE[0]}")
+[[ -r ${PATH_DIR}/util.sh ]] && source "${PATH_DIR}/util.sh"
+
+printf "${GREEN}-----------------------------------------------------------------------${ALL_OFF}\n"
+printf "${GREEN}                          ████                               █████     ${ALL_OFF}\n"
+printf "${GREEN}                         ░░███                              ░░███      ${ALL_OFF}\n"
+printf "${GREEN}  █████ ███ █████  █████  ░███   ██████   ████████   ██████  ░███████  ${ALL_OFF}\n"
+printf "${GREEN} ░░███ ░███░░███  ███░░   ░███  ░░░░░███ ░░███░░███ ███░░███ ░███░░███ ${ALL_OFF}\n"
+printf "${GREEN}  ░███ ░███ ░███ ░░█████  ░███   ███████  ░███ ░░░ ░███ ░░░  ░███ ░███ ${ALL_OFF}\n"
+printf "${GREEN}  ░░███████████   ░░░░███ ░███  ███░░███  ░███     ░███  ███ ░███ ░███ ${ALL_OFF}\n"
+printf "${GREEN}   ░░████░████    ██████  █████░░████████ █████    ░░██████  ████ █████${ALL_OFF}\n"
+printf "${GREEN}    ░░░░ ░░░░    ░░░░░░  ░░░░░  ░░░░░░░░ ░░░░░      ░░░░░░  ░░░░ ░░░░░ ${ALL_OFF}\n"
+printf "${BLUE}  Description	:Build arch linux distro for wsl${ALL_OFF}\n"
+printf "${BLUE}  Author       	:Abdalrohman alnassier${ALL_OFF}\n"
+printf "${BLUE}  Email         :abdd199719@gmail.com ${ALL_OFF}\n"
+printf "${GREEN}-----------------------------------------------------------------------${ALL_OFF}\n"
+
+# Variables
+[[ -z ${PROFILE_DIR} ]] && PROFILE_DIR=$PATH_DIR/wsl
+[[ -z ${BUILD_DIR} ]] && BUILD_DIR=/var/wsl-build/build/$(basename "${PROFILE_DIR}")
+pacman_conf="/etc/pacman.conf"
+#### lsb config variable
+[[ -z ${LSB_VERSION} ]] && LSB_VERSION=""
+[[ -z ${RELEASE} ]] && RELEASE=""
+[[ -z ${CODENAME} ]] && CODENAME=""
+[[ -z ${ID} ]] && ID="ManjaroLinux"
+[[ -z ${DESCRIPTION} ]] && DESCRIPTION="Manjaro Linux"
+
+# Show help usage, with an exit status.
+# $1: exit status number.
+usage() {
+	echo "usage ${0##*/} [options]"
+	echo '    -c                 Disable clean work dir'
+	echo "    -p <profile_dir>   Specify profile directory ${PROFILE_DIR}"
+	echo "    -b <build_dir>     Specify build directory ${BUILD_DIR}"
+	echo '    -C <config>        Config file for pacman by default use /etc/pacman.conf.'
+	echo '    -u                 Enable update must use with (-U).'
+	echo '    -U <pkg>           Update rootfs.'
+	echo '                       [using: build.sh -uU zsh -U bash ...]'
+    echo '    -g <key>           The gpg key for tar signing'
+    echo "                       [default: ${gpgkey}]"
+	exit "${1}"
+}
+
+CLEAN=false
+UPDATE=false
+
+while getopts 'b:p:g:P:C:U:uch' arg; do
+	case "${arg}" in
+	p) PROFILE_DIR=$OPTARG ;;
+	b) BUILD_DIR=$OPTARG ;;
+	c) CLEAN=true ;;
+	C) pacman_conf="${OPTARG}" ;;
+	u) UPDATE=true ;;
+	U) update_root+=("${OPTARG}") ;;
+	g) gpgkey="$OPTARG" ;;
+	h) usage 0 ;;
+	*)
+		echo "invalid argument $arg"
+		usage 1
+		;;
+	esac
+done
+shift $((OPTIND - 1))
+
+# check is script running as root
+if [[ "${EUID}" -ne 0 ]]; then
+	die "This script must be run as root."
+fi
+
+# check if valid profile
+check_profile() {
+	local keyfiles="$1/Packages-Root"
+	local keydirs=("$1/root-overlay"
+		"$1/local-pkgs")
+	local has_keyfiles=false has_keydirs=false
+
+	if [[ -f $keyfiles ]]; then
+		has_keyfiles=true
+	else
+		has_keyfiles=false
+	fi
+	for d in "${keydirs[@]}"; do
+		if [[ -d $d ]]; then
+			has_keydirs=true
+		else
+			has_keydirs=false
+			break
+		fi
+	done
+	if ! ${has_keyfiles} && ! ${has_keydirs}; then
+		die "Profile [%s] not valid!" "$1"
+	else
+		passed "profile passed"
+	fi
+}
+
+# prepare directory 
+initialize() {
+	prepare_dir "$BUILD_DIR"
+	rootfs="$BUILD_DIR/rootfs"
+	prepare_dir "${rootfs}"
+	img_dir=$BUILD_DIR/img
+	prepare_dir "${img_dir}"
+}
+
+# load pkg from file
+load_pkgs() {
+    info "Loading Packages: [%s] ..." "${1##*/}"
+
+    local _space="s| ||g" \
+        _clean=':a;N;$!ba;s/\n/ /g' \
+        _com_rm="s|#.*||g"
+
+    packages=($(sed "$_com_rm" "$1" \
+            | sed "$_space" \
+            | sed "$_clean"))
+}
+
+# Install offline package to chroot
+local_pkg_install() {
+    msg "Prepare local pkgs installation"
+    local src="${PROFILE_DIR}/local-pkgs"
+    if [ "$(ls -A "${src}")" ]; then
+        # pacstrap -U "$1/rootfs" "${src}/*"
+		unshare --fork --pid pacman -r "$1" -U --noconfirm "${src}/*"
+    else
+        warning "${src} is Empty"
+    fi
+	msg "Done installation of local pkgs"
+}
+
+# update rootfs without reinstall all packages
+update_rootfs() {
+	newroot="${rootfs}"
+	pacman_args=("${@}")
+	pacman_args+=(--noconfirm)
+	pacman_args+=(--config="$pacman_conf")
+	unshare --fork --pid pacman -r "$newroot" -Sy "${pacman_args[@]}"
+	return
+}
+
+make_chroot() {
+	cache_dirs=($(pacman -v "$cache_conf" 2>&1 | grep '^Cache Dirs:' | sed 's/Cache Dirs:\s*//g'))
+	lock 9 "${1}.lock" "Locking chroot"
+	./baseinstall -cd -C "${pacman_conf}" "${rootfs}" "${cache_dirs[@]/#/--cachedir=}" "${packages[@]}" || die
+	local_pkg_install "$1"
+
+	info "Using build locales ..."
+	mv "$1/etc/locale.gen" "$1/etc/locale.gen.bak"
+	mv "$1/etc/locale.conf" "$1/etc/locale.conf.bak"
+	printf '%s.UTF-8 UTF-8\n' en_US >"$1/etc/locale.gen"
+	printf 'LANG=%s.UTF-8\n' en_US >"$1/etc/locale.conf"
+	printf 'LC_MESSAGES=C\n' >>"$1/etc/locale.conf"
+
+	eval arch-chroot "$1" locale-gen
+}
+
+configure_lsb(){
+	msg "Lsb configuration"
+	{
+	echo "LSB_VERSION=${LSB_VERSION}"
+    echo "DISTRIB_ID=${ID}"
+	echo "DISTRIB_DESCRIPTION=\"${DESCRIPTION}\""
+    echo "DISTRIB_RELEASE=${RELEASE}"
+    echo "DISTRIB_CODENAME=${CODENAME}"
+	} >> "${rootfs}/etc/lsb-release"
+	msg2 "Done lsb configuration"
+}
+
+# Base installation (rootfs)
+make_rootfs() {
+	if [[ ! -e "${BUILD_DIR}/build.${FUNCNAME}" ]]; then
+		msg "Prepare [Base installation] (%s)" "${rootfs}"
+
+		load_pkgs "${PROFILE_DIR}/Packages-Root"
+		make_chroot "${rootfs}"
+
+		pacman -Qr "${rootfs}" > "${rootfs}/rootfs-pkgs.txt"
+		copy_overlay "${PATH_DIR}/files-overlay" "${rootfs}"
+		configure_lsb
+
+		clean_up_image "${rootfs}"
+		: >"${BUILD_DIR}/build.${FUNCNAME}"
+		msg "Done [Base installation] (%s)" "${rootfs}"
+	fi
+}
+
+# make tar image from rootfs
+make_tar() {
+	if [[ ! -e "${BUILD_DIR}/img/build.${FUNCNAME}" ]]; then
+		if [[ ! -e "$rootfs" ]]; then
+			error "The path %s does not exist" "$rootfs"
+			return 1
+    	fi
+		msg "Prepare tar image (%s)" "${img_dir}"
+		local imagename="rootfs.tar.gz"
+		
+		cd "$rootfs" || return
+		sudo tar -cf - -- * | \
+				(pv -p -t -r -b -W --size "$(du -sb "$rootfs" | awk '{print $1}')") | \
+				gzip > "${img_dir}/${imagename}"
+		cd "$OLDPWD" || return
+		make_checksum "${img_dir}" "${imagename}"
+		if [[ -n ${gpgkey} ]]; then
+        	make_sig "${img_dir}" "${imagename}"
+    	fi
+		msg2 "Done with tar image"
+		: >"${BUILD_DIR}/img/build.${FUNCNAME}"
+	fi
+}
+
+# Cleanup rootfs
+clean_up_image(){
+    msg "Cleaning [%s]" "${1##*/}"
+
+    local path
+    [[ -f "$1/etc/locale.gen.bak" ]] && mv "$1/etc/locale.gen.bak" "$1/etc/locale.gen"
+    [[ -f "$1/etc/locale.conf.bak" ]] && mv "$1/etc/locale.conf.bak" "$1/etc/locale.conf"
+    path=$1/etc/machine-id
+    if [[ -f $path ]]; then
+        find "$path" -type f -delete &> /dev/null
+    fi
+	# Delete pacman database sync cache files (*.tar.gz)
+	path=$1/var/lib/pacman
+	if [[ -f $path ]]; then
+        find "$path" -maxdepth 1 -type f -delete &> /dev/null
+    fi
+	# Delete pacman database sync cache
+    path=$1/var/lib/pacman/sync
+    if [[ -d $path ]]; then
+        find "$path" -type f -delete &> /dev/null
+    fi
+	# Delete pacman package cache
+    path=$1/var/cache/pacman/pkg
+    if [[ -d $path ]]; then
+        find "$path" -type f -delete &> /dev/null
+    fi
+	# Delete all log files, keeps empty dirs.
+    path=$1/var/log
+    if [[ -d $path ]]; then
+        find "$path" -type f -delete &> /dev/null
+    fi
+	# Delete all temporary files and dirs
+    path=$1/var/tmp
+    if [[ -d $path ]]; then
+        find "$path" -mindepth 1 -delete &> /dev/null
+    fi
+    path=$1/tmp
+    if [[ -d $path ]]; then
+        find "$path" -mindepth 1 -delete &> /dev/null
+    fi
+	# Delete package pacman related files.
+	find "$1" -name "*.pacnew" -name "*.pacsave" -name "*.pacorig" -delete
+
+	path=$1/sys
+	if [[ -d $path ]]; then
+		find "$path" -mindepth 1 -delete &> /dev/null
+	fi
+	path=$1/proc
+	if [[ -d $path ]]; then
+		find "$path" -mindepth 1 -delete &> /dev/null
+	fi
+	path=$1/etc/pacman.d/gnupg
+	if [[ -d $path ]]; then
+		find "$path" -type s -name "S.*" -delete &> /dev/null
+	fi
+	path=$1/etc/pacman.d/gnupg
+	if [[ -d $path ]]; then
+		find "$path" -type f -name "pubring.gpg~" -delete &> /dev/null
+	fi
+	path=$1/etc/pacman.d/gnupg/openpgp-revocs.d
+	if [[ -d $path ]]; then
+		find "$path" -type f -name "*" -delete &> /dev/null
+	fi
+	path=$1/etc/pacman.d/gnupg/private-keys-v1.d
+	if [[ -d $path ]]; then
+		find "$path" -type f -name "*" -delete &> /dev/null
+	fi
+
+    msg2 "Done cleaning [%s]" "${1##*/}"
+}
+
+chroot_clean() {
+	msg "Cleaning up [%s]" "$1"
+	exec 9>&-
+    rm -rf --one-file-system "$1"
+}
+
+build() {
+	if ${CLEAN}; then
+		chroot_clean "$BUILD_DIR"
+	fi
+	initialize
+	check_profile "$PROFILE_DIR"
+	msg "Start building wsl image"
+	if $UPDATE; then
+		update_rootfs "${update_root[@]}"
+	fi
+	if ! $UPDATE; then
+		make_rootfs
+	fi
+	make_tar
+	msg "Finished building image"
+}
+
+build
+
